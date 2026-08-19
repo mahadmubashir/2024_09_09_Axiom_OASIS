@@ -1,9 +1,6 @@
-import traceback  # noqa: D100
-
-try:
-    import cupy as cp
-except ImportError:
-    import numpy as cp  # fallback for macOS
+import shutil  # noqa: D100
+import subprocess
+import traceback
 
 import pandas as pd
 import polars as pl
@@ -13,11 +10,22 @@ from tqdm.contrib.concurrent import thread_map
 from xgboost import XGBClassifier
 
 
+def detect_gpu_count() -> int:
+    """Count available NVIDIA GPUs via nvidia-smi. Returns 0 if none/unavailable."""
+    if shutil.which("nvidia-smi") is None:
+        return 0
+    try:
+        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, check=True)  # noqa: S603, S607
+        return len([line for line in out.stdout.splitlines() if line.strip()])
+    except subprocess.CalledProcessError:
+        return 0
+
+
 def binary_classifier(
     dat: pd.DataFrame,
     meta: pd.DataFrame,
     n_splits: int,
-    gpu_id: int,
+    gpu_id: int | None,
     *,
     shuffle: bool = False,
     cc: bool = False,
@@ -32,6 +40,8 @@ def binary_classifier(
         Metadata associated with the input data.
     n_splits : int
         Number of folds for cross-validation.
+    gpu_id : int | None
+        CUDA device index to train on, or None to train on CPU.
     shuffle : bool, optional
         Whether to shuffle the data before splitting (default is False).
 
@@ -54,48 +64,49 @@ def binary_classifier(
     if shuffle:
         y = y.sample(frac=1, random_state=42).reset_index(drop=True)
 
+    device = f"cuda:{gpu_id}" if gpu_id is not None else "cpu"
+
     kf = StratifiedKFold(n_splits=n_splits)
 
     pred_df = []
     fold = 1
-    with cp.cuda.Device(gpu_id):
-        for train_index, val_index in kf.split(x, y):
-            x_fold_train, x_fold_val = cp.array(x.iloc[train_index].to_numpy()), cp.array(x.iloc[val_index].to_numpy())
-            y_fold_train, y_fold_val = y.iloc[train_index], y.iloc[val_index]
+    for train_index, val_index in kf.split(x, y):
+        x_fold_train, x_fold_val = x.iloc[train_index].to_numpy(), x.iloc[val_index].to_numpy()
+        y_fold_train, y_fold_val = y.iloc[train_index], y.iloc[val_index]
 
-            le = LabelEncoder()
-            y_fold_train = cp.array(le.fit_transform(y_fold_train))
-            y_fold_val = cp.array(le.fit_transform(y_fold_val))
+        le = LabelEncoder()
+        y_fold_train = le.fit_transform(y_fold_train)
+        y_fold_val = le.fit_transform(y_fold_val)
 
-            meta_fold_val = meta.iloc[val_index]
+        meta_fold_val = meta.iloc[val_index]
 
-            # Initialize the model
-            model = XGBClassifier(
-                objective="binary:logistic",
-                n_estimators=150,
-                tree_method="hist",
-                device=f"cuda:{gpu_id}",
-                learning_rate=0.05,
-                scale_pos_weight=(y_fold_train == 0).sum() / (y_fold_train == 1).sum(),
-            )
+        # Initialize the model. XGBoost moves numpy input to `device` itself, no cupy needed.
+        model = XGBClassifier(
+            objective="binary:logistic",
+            n_estimators=150,
+            tree_method="hist",
+            device=device,
+            learning_rate=0.05,
+            scale_pos_weight=(y_fold_train == 0).sum() / (y_fold_train == 1).sum(),
+        )
 
-            # Train the model on the fold training set
-            model.fit(x_fold_train, y_fold_train)
+        # Train the model on the fold training set
+        model.fit(x_fold_train, y_fold_train)
 
-            # Validate the model on the fold validation set
-            y_fold_prob = model.predict_proba(x_fold_val)[:, 1]
-            y_fold_pred = model.predict(x_fold_val)
+        # Validate the model on the fold validation set
+        y_fold_prob = model.predict_proba(x_fold_val)[:, 1]
+        y_fold_pred = model.predict(x_fold_val)
 
-            pred_df.append(
-                pl.DataFrame({
-                    "Metadata_OASIS_ID": list(meta_fold_val["Metadata_OASIS_ID"]),
-                    "y_prob": list(y_fold_prob),
-                    "y_pred": list(y_fold_pred),
-                    "y_actual": list(y_fold_val),
-                    "k_fold": fold,
-                }),
-            )
-            fold += 1
+        pred_df.append(
+            pl.DataFrame({
+                "Metadata_OASIS_ID": list(meta_fold_val["Metadata_OASIS_ID"]),
+                "y_prob": list(y_fold_prob),
+                "y_pred": list(y_fold_pred),
+                "y_actual": list(y_fold_val),
+                "k_fold": fold,
+            }),
+        )
+        fold += 1
 
     return pl.concat(pred_df, how="vertical")
 
@@ -160,7 +171,8 @@ def predict_binary(
 
     """
     n_splits = 5
-    num_gpus = 4
+    gpu_count = detect_gpu_count()
+    num_workers = max(gpu_count, 1)
 
     dat = pl.read_parquet(input_path)
     meta = pl.read_parquet(label_path).rename({"OASIS_ID": "Metadata_OASIS_ID"})
@@ -170,7 +182,7 @@ def predict_binary(
 
     agg_types = dat.select("Metadata_AggType").to_series().unique().to_list()
     tasks = [
-        (dat, label_column, agg_type, n_splits, labels, i % num_gpus)
+        (dat, label_column, agg_type, n_splits, labels, (i % gpu_count) if gpu_count else None)
         for i, (label_column, agg_type) in enumerate(
             [(label_column, agg_type) for label_column in labels for agg_type in agg_types]
         )
@@ -180,7 +192,7 @@ def predict_binary(
     pred_results = thread_map(
         lambda args: process_label_and_agg(*args, shuffle=False),
         tasks,
-        max_workers=num_gpus,
+        max_workers=num_workers,
         desc="Processing labels and agg_types",
     )
 
@@ -195,7 +207,7 @@ def predict_binary(
     null_results = thread_map(
         lambda args: process_label_and_agg(*args, shuffle=True),
         tasks,
-        max_workers=num_gpus,
+        max_workers=num_workers,
         desc="Processing labels and agg_types",
     )
 
@@ -210,7 +222,7 @@ def predict_binary(
     cc_results = thread_map(
         lambda args: process_label_and_agg(*args, cc=True),
         tasks,
-        max_workers=num_gpus,
+        max_workers=num_workers,
         desc="Processing labels and agg_types",
     )
 
